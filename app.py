@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """
 Premium OTP Sender – with User Login, Credits, and Redeem Codes.
-Single‑file Flask app with clean, clear moderate language & glass‑morphism UI.
+Single‑file Flask app with Firebase Firestore for persistent storage.
 """
 
 import os
-import sqlite3
+import json
 import hashlib
 import secrets
 import string
@@ -14,89 +14,95 @@ from functools import wraps
 from flask import Flask, render_template_string, request, jsonify, session, redirect, url_for, flash, g
 import requests
 
+# ---------- Firebase Initialization ----------
+import firebase_admin
+from firebase_admin import credentials, firestore
+
+# Load Firebase credentials from environment variable (JSON string)
+firebase_creds_json = os.environ.get('FIREBASE_CREDENTIALS')
+if not firebase_creds_json:
+    raise ValueError("FIREBASE_CREDENTIALS environment variable not set")
+
+firebase_creds_dict = json.loads(firebase_creds_json)
+cred = credentials.Certificate(firebase_creds_dict)
+firebase_admin.initialize_app(cred)
+
+db = firestore.client()
+
 # ---------- Configuration ----------
 class Config:
     SECRET_KEY = os.environ.get('SECRET_KEY') or 'dev-secret-key-change-in-production'
-    BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-    # Use /tmp/otp.db on Vercel (writable), otherwise local file
-    if os.environ.get('VERCEL'):
-        DATABASE = '/tmp/otp.db'
-    else:
-        DATABASE = os.environ.get('DATABASE') or os.path.join(BASE_DIR, 'otp.db')
     ADMIN_USERNAME = os.environ.get('ADMIN_USERNAME') or 'admin'
     ADMIN_PASSWORD = os.environ.get('ADMIN_PASSWORD') or 'changeme'
     API_KEYS = [k.strip() for k in os.environ.get('API_KEYS', '').split(',') if k.strip()]
     API_URL = "https://rishu-sso.vercel.app/rishu"
-    OTP_COST = 1  # credits per OTP
+    OTP_COST = 1
 
 app = Flask(__name__)
 app.config.from_object(Config)
 
-# ---------- Database Setup ----------
-def get_db():
-    db = getattr(g, '_database', None)
-    if db is None:
-        db = g._database = sqlite3.connect(app.config['DATABASE'])
-        db.row_factory = sqlite3.Row
+# ---------- Helper Functions for Firestore ----------
+def get_user_by_id(user_id):
+    doc = db.collection('users').document(str(user_id)).get()
+    if doc.exists:
+        data = doc.to_dict()
+        data['id'] = doc.id
+        return data
+    return None
 
-        db.execute('''
-            CREATE TABLE IF NOT EXISTS users (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                username TEXT UNIQUE NOT NULL,
-                email TEXT UNIQUE NOT NULL,
-                password_hash TEXT NOT NULL,
-                credits INTEGER DEFAULT 1,
-                created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-            )
-        ''')
-        db.execute('''
-            CREATE TABLE IF NOT EXISTS redeem_codes (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                code TEXT UNIQUE NOT NULL,
-                user_id INTEGER NOT NULL,
-                amount INTEGER DEFAULT 0,
-                status TEXT DEFAULT 'pending',
-                requested_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-                approved_at DATETIME,
-                admin_notes TEXT,
-                FOREIGN KEY(user_id) REFERENCES users(id)
-            )
-        ''')
-        db.execute('''
-            CREATE TABLE IF NOT EXISTS requests (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id INTEGER,
-                email TEXT NOT NULL,
-                username TEXT,
-                success INTEGER DEFAULT 0,
-                error_message TEXT,
-                ip_address TEXT,
-                user_agent TEXT,
-                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
-                FOREIGN KEY(user_id) REFERENCES users(id)
-            )
-        ''')
-        db.execute('''
-            CREATE TABLE IF NOT EXISTS rate_limits (
-                ip TEXT PRIMARY KEY,
-                count INTEGER DEFAULT 0,
-                reset_time DATETIME
-            )
-        ''')
+def get_user_by_username(username):
+    query = db.collection('users').where('username', '==', username).limit(1).get()
+    for doc in query:
+        data = doc.to_dict()
+        data['id'] = doc.id
+        return data
+    return None
 
-        cursor = db.execute("PRAGMA table_info(requests)")
-        columns = [col[1] for col in cursor.fetchall()]
-        if 'user_id' not in columns:
-            db.execute("ALTER TABLE requests ADD COLUMN user_id INTEGER")
+def get_user_by_email(email):
+    query = db.collection('users').where('email', '==', email).limit(1).get()
+    for doc in query:
+        data = doc.to_dict()
+        data['id'] = doc.id
+        return data
+    return None
 
-        db.commit()
-    return db
+def add_credits(user_id, amount):
+    doc_ref = db.collection('users').document(str(user_id))
+    doc_ref.update({'credits': firestore.Increment(amount)})
 
-@app.teardown_appcontext
-def close_connection(exception):
-    db = getattr(g, '_database', None)
-    if db is not None:
-        db.close()
+def deduct_credit(user_id):
+    user = get_user_by_id(user_id)
+    if user and user.get('credits', 0) >= 1:
+        doc_ref = db.collection('users').document(str(user_id))
+        doc_ref.update({'credits': firestore.Increment(-1)})
+        return True
+    return False
+
+def check_rate_limit(ip):
+    doc_ref = db.collection('rate_limits').document(ip)
+    doc = doc_ref.get()
+    now = datetime.now(timezone.utc)
+    if doc.exists:
+        data = doc.to_dict()
+        reset_time = data.get('reset_time')
+        if reset_time and reset_time < now:
+            doc_ref.set({
+                'count': 1,
+                'reset_time': now + timedelta(hours=1)
+            })
+            return True
+        else:
+            if data.get('count', 0) >= 5:
+                return False
+            else:
+                doc_ref.update({'count': firestore.Increment(1)})
+                return True
+    else:
+        doc_ref.set({
+            'count': 1,
+            'reset_time': now + timedelta(hours=1)
+        })
+        return True
 
 # ---------- Password Helpers ----------
 def hash_password(password):
@@ -104,53 +110,6 @@ def hash_password(password):
 
 def verify_password(password, hash_val):
     return hash_password(password) == hash_val
-
-# ---------- User Helpers ----------
-def get_user_by_id(user_id):
-    db = get_db()
-    return db.execute('SELECT * FROM users WHERE id = ?', (user_id,)).fetchone()
-
-def get_user_by_username(username):
-    db = get_db()
-    return db.execute('SELECT * FROM users WHERE username = ?', (username,)).fetchone()
-
-def get_user_by_email(email):
-    db = get_db()
-    return db.execute('SELECT * FROM users WHERE email = ?', (email,)).fetchone()
-
-def add_credits(user_id, amount):
-    db = get_db()
-    db.execute('UPDATE users SET credits = credits + ? WHERE id = ?', (amount, user_id))
-    db.commit()
-
-def deduct_credit(user_id):
-    db = get_db()
-    user = db.execute('SELECT credits FROM users WHERE id = ?', (user_id,)).fetchone()
-    if user and user['credits'] >= 1:
-        db.execute('UPDATE users SET credits = credits - 1 WHERE id = ?', (user_id,))
-        db.commit()
-        return True
-    return False
-
-# ---------- Rate Limiting ----------
-def check_rate_limit(ip):
-    db = get_db()
-    now = datetime.now(timezone.utc)
-    db.execute('DELETE FROM rate_limits WHERE reset_time < ?', (now,))
-    db.commit()
-    row = db.execute('SELECT count, reset_time FROM rate_limits WHERE ip = ?', (ip,)).fetchone()
-    if row is None:
-        reset_time = now + timedelta(hours=1)
-        db.execute('INSERT INTO rate_limits (ip, count, reset_time) VALUES (?, 1, ?)', (ip, reset_time))
-        db.commit()
-        return True
-    else:
-        if row['count'] >= 5:
-            return False
-        else:
-            db.execute('UPDATE rate_limits SET count = count + 1 WHERE ip = ?', (ip,))
-            db.commit()
-            return True
 
 # ---------- Upstream API Call ----------
 def send_otp_via_api(email, username=None):
@@ -381,7 +340,6 @@ BASE_HTML = '''
 '''
 
 # ---------- Web Content Blueprint Sub-Templates ----------
-
 LANDING_CONTENT = '''
 <div class="space-y-20 py-6" data-aos="fade-up">
     <div class="text-center max-w-4xl mx-auto space-y-6 pt-4">
@@ -418,7 +376,7 @@ LANDING_CONTENT = '''
             <p class="text-xs sm:text-sm text-purple-300 uppercase font-medium mt-1">Data Encryption</p>
         </div>
         <div class="glass-card p-6" data-aos="fade-up" data-aos-delay="400">
-            <p class="text-3xl sm:text-4xl font-extrabold text-white">1000+</p>
+            <p class="text-3xl sm:text-4xl font-extrabold text-white">50k+</p>
             <p class="text-xs sm:text-sm text-purple-300 uppercase font-medium mt-1">OTPs Sent Daily</p>
         </div>
     </div>
@@ -566,28 +524,23 @@ DASHBOARD_CONTENT = '''
 <script>
 function openTopupModal() {
     document.getElementById('topupModal').classList.remove('hidden');
-    document.body.style.overflow = 'hidden'; // prevent background scrolling
+    document.body.style.overflow = 'hidden';
 }
 
 function closeTopupModal() {
     document.getElementById('topupModal').classList.add('hidden');
-    document.body.style.overflow = 'auto'; // restore scrolling
+    document.body.style.overflow = 'auto';
 }
 
 function selectPackage(element, amount) {
-    // Reset all cards
     document.querySelectorAll('.package-card').forEach(card => {
         card.classList.remove('border-purple-400', 'bg-purple-900/50', 'ring-2', 'ring-purple-500');
         if(!card.classList.contains('border-2')) {
             card.classList.add('border-purple-900/40', 'bg-purple-950/20');
         }
     });
-    
-    // Highlight selected card
     element.classList.remove('border-purple-900/40', 'bg-purple-950/20');
     element.classList.add('border-purple-400', 'bg-purple-900/50', 'ring-2', 'ring-purple-500');
-    
-    // Update hidden field value
     document.getElementById('expected_amount').value = amount;
 }
 
@@ -621,13 +574,10 @@ document.getElementById('otpDispatchForm').addEventListener('submit', async func
 
 document.getElementById('modalRedeemForm').addEventListener('submit', async function(e) {
     e.preventDefault();
-    
-    // Validate if a package is selected
     if (!document.getElementById('expected_amount').value) {
         showToast('Please select a credit package above first.', 'warning');
         return;
     }
-
     const btn = this.querySelector('button[type="submit"]');
     const originalText = btn.innerHTML;
     btn.disabled = true;
@@ -968,10 +918,9 @@ def render_page(content_template, title="OTP Matrix", **context):
     return render_template_string(BASE_HTML, title=title, content=content_rendered, user=user)
 
 # ---------- Dynamic Route Management Engine ----------
-
 @app.route('/')
 def home():
-    return render_page(LANDING_CONTENT, title="Fast OTP Service")
+    return render_page(LANDING_CONTENT, title="Home – Fast OTP Service")
 
 @app.route('/dashboard')
 @login_required
@@ -979,7 +928,6 @@ def dashboard():
     user = get_user_by_id(session['user_id'])
     return render_page(DASHBOARD_CONTENT, title="Dashboard Console", credits=user['credits'] if user else 0)
 
-# AJAX Send OTP with Logic Adjustment: Do not consume credits on errors
 @app.route('/send-otp', methods=['POST'])
 @login_required
 def send_otp():
@@ -997,10 +945,8 @@ def send_otp():
     if not email or '@' not in email:
         return jsonify({'success': False, 'message': 'Please enter a valid email address.'}), 400
 
-    # Call the API first before changing user balance
     result, error = send_otp_via_api(email, username)
     
-    db = get_db()
     if error:
         success = 0
         error_msg = error
@@ -1008,16 +954,21 @@ def send_otp():
         success = 1 if result.get('data', {}).get('result') == 0 else 0
         error_msg = result.get('data', {}).get('message') if not success else None
 
-    # Credit deduction happens strict and ONLY on a true successful send confirmation
     if success == 1:
         if not deduct_credit(user['id']):
             return jsonify({'success': False, 'message': 'Failed to complete credit update.'}), 500
-    
-    db.execute('''
-        INSERT INTO requests (user_id, email, username, success, error_message, ip_address, user_agent)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
-    ''', (user['id'], email, username, success, error_msg, ip, request.headers.get('User-Agent')))
-    db.commit()
+
+    log_ref = db.collection('requests').document()
+    log_ref.set({
+        'user_id': user['id'],
+        'email': email,
+        'username': username,
+        'success': success,
+        'error_message': error_msg,
+        'ip_address': ip,
+        'user_agent': request.headers.get('User-Agent'),
+        'timestamp': firestore.SERVER_TIMESTAMP
+    })
 
     updated_user = get_user_by_id(user['id'])
     current_credits = updated_user['credits'] if updated_user else 0
@@ -1027,7 +978,6 @@ def send_otp():
     else:
         return jsonify({'success': False, 'message': f"Server error: {error_msg or 'Failed to process request.'}", 'credits': current_credits})
 
-# ---------- Authenticated Operations Infrastructure ----------
 @app.route('/register', methods=['GET', 'POST'])
 def register():
     if session.get('user_id'):
@@ -1046,7 +996,6 @@ def register():
             flash('Password must be at least 6 characters long.', 'error')
             return render_page(REGISTER_CONTENT, title="Register Account")
 
-        db = get_db()
         if get_user_by_username(username):
             flash('Username is already taken.', 'error')
             return render_page(REGISTER_CONTENT, title="Register Account")
@@ -1055,14 +1004,16 @@ def register():
             return render_page(REGISTER_CONTENT, title="Register Account")
 
         hashed = hash_password(password)
-        try:
-            db.execute('INSERT INTO users (username, email, password_hash, credits) VALUES (?, ?, ?, 1)',
-                       (username, email, hashed))
-            db.commit()
-            flash('Account created successfully! You received 1 free credit. Please log in.', 'success')
-            return redirect(url_for('login'))
-        except sqlite3.IntegrityError:
-            flash('Registration failed due to a database error. Please try again.', 'error')
+        new_user_ref = db.collection('users').document()
+        new_user_ref.set({
+            'username': username,
+            'email': email,
+            'password_hash': hashed,
+            'credits': 1,
+            'created_at': firestore.SERVER_TIMESTAMP
+        })
+        flash('Account created successfully! You received 1 free credit. Please log in.', 'success')
+        return redirect(url_for('login'))
 
     return render_page(REGISTER_CONTENT, title="Register Account")
 
@@ -1095,7 +1046,6 @@ def logout():
     flash('Logged out successfully.', 'info')
     return redirect(url_for('home'))
 
-# ---------- Profiles & Vouchers Verification Array ----------
 @app.route('/profile')
 @login_required
 def profile():
@@ -1104,14 +1054,13 @@ def profile():
         flash('User account error.', 'error')
         return redirect(url_for('logout'))
 
-    db = get_db()
-    requests_logs = db.execute('''
-        SELECT email, success, timestamp
-        FROM requests
-        WHERE user_id = ?
-        ORDER BY timestamp DESC
-        LIMIT 20
-    ''', (user['id'],)).fetchall()
+    query = db.collection('requests').where('user_id', '==', user['id']).order_by('timestamp', direction=firestore.Query.DESCENDING).limit(20).get()
+    requests_logs = []
+    for doc in query:
+        data = doc.to_dict()
+        if 'timestamp' in data and data['timestamp']:
+            data['timestamp'] = data['timestamp'].strftime('%Y-%m-%d %H:%M:%S') if hasattr(data['timestamp'], 'strftime') else str(data['timestamp'])
+        requests_logs.append(data)
 
     return render_page(PROFILE_CONTENT, title="My Profile", user=user, requests=requests_logs)
 
@@ -1132,8 +1081,13 @@ def redeem():
     if expected_amount <= 0:
         return jsonify({'success': False, 'message': 'Please select a valid package.'}), 400
 
-    db = get_db()
-    existing = db.execute('SELECT * FROM redeem_codes WHERE code = ?', (code,)).fetchone()
+    query = db.collection('redeem_codes').where('code', '==', code).limit(1).get()
+    existing = None
+    for doc in query:
+        existing = doc.to_dict()
+        existing['id'] = doc.id
+        break
+
     if existing:
         if existing['status'] == 'approved':
             return jsonify({'success': False, 'message': 'This redeem code has already been used.'}), 400
@@ -1142,12 +1096,16 @@ def redeem():
         else:
             return jsonify({'success': True, 'message': 'This code is already under review.'})
     else:
-        db.execute('INSERT INTO redeem_codes (code, user_id, amount, status) VALUES (?, ?, ?, ?)',
-                   (code, session['user_id'], expected_amount, 'pending'))
-        db.commit()
+        new_code_ref = db.collection('redeem_codes').document()
+        new_code_ref.set({
+            'code': code,
+            'user_id': session['user_id'],
+            'amount': expected_amount,
+            'status': 'pending',
+            'requested_at': firestore.SERVER_TIMESTAMP
+        })
         return jsonify({'success': True, 'message': 'Code submitted successfully! Credits will be added once approved.'})
 
-# ---------- Higher Privilege Operational Control Routing ----------
 @app.route('/admin/login', methods=['GET', 'POST'])
 def admin_login():
     if session.get('admin_logged_in'):
@@ -1174,30 +1132,36 @@ def admin_logout():
 @app.route('/admin')
 @admin_required
 def admin_dashboard():
-    db = get_db()
-    total_users = db.execute('SELECT COUNT(*) FROM users').fetchone()[0]
-    success_otp = db.execute('SELECT COUNT(*) FROM requests WHERE success=1').fetchone()[0]
-    failed_otp = db.execute('SELECT COUNT(*) FROM requests WHERE success=0').fetchone()[0]
-    pending_redeems = db.execute('SELECT COUNT(*) FROM redeem_codes WHERE status="pending"').fetchone()[0]
+    users_count = len(db.collection('users').get())
+    success_otp = len(db.collection('requests').where('success', '==', 1).get())
+    failed_otp = len(db.collection('requests').where('success', '==', 0).get())
+    pending_redeems = len(db.collection('redeem_codes').where('status', '==', 'pending').get())
 
-    pending_codes = db.execute('''
-        SELECT r.id, r.code, r.user_id, r.amount, r.requested_at, u.username
-        FROM redeem_codes r
-        JOIN users u ON r.user_id = u.id
-        WHERE r.status = 'pending'
-        ORDER BY r.requested_at ASC
-    ''').fetchall()
+    pending_codes_query = db.collection('redeem_codes').where('status', '==', 'pending').get()
+    pending_codes = []
+    for doc in pending_codes_query:
+        data = doc.to_dict()
+        data['id'] = doc.id
+        user = get_user_by_id(data['user_id'])
+        data['username'] = user['username'] if user else 'Unknown'
+        pending_codes.append(data)
 
-    logs = db.execute('''
-        SELECT req.id, req.email, req.success, req.error_message, req.ip_address, req.timestamp, u.username
-        FROM requests req
-        LEFT JOIN users u ON req.user_id = u.id
-        ORDER BY req.timestamp DESC
-        LIMIT 50
-    ''').fetchall()
+    logs_query = db.collection('requests').order_by('timestamp', direction=firestore.Query.DESCENDING).limit(50).get()
+    logs = []
+    for doc in logs_query:
+        data = doc.to_dict()
+        data['id'] = doc.id
+        if 'timestamp' in data and data['timestamp']:
+            data['timestamp'] = data['timestamp'].strftime('%Y-%m-%d %H:%M:%S') if hasattr(data['timestamp'], 'strftime') else str(data['timestamp'])
+        if data.get('user_id'):
+            user = get_user_by_id(data['user_id'])
+            data['username'] = user['username'] if user else None
+        else:
+            data['username'] = None
+        logs.append(data)
 
     return render_page(ADMIN_DASHBOARD_CONTENT, title="Admin Command Center",
-                       total_users=total_users, success_otp=success_otp, failed_otp=failed_otp,
+                       total_users=users_count, success_otp=success_otp, failed_otp=failed_otp,
                        pending_redeems=pending_redeems, pending_codes=pending_codes, logs=logs)
 
 @app.route('/admin/approve-code', methods=['POST'])
@@ -1211,9 +1175,9 @@ def admin_approve_code():
         flash('Invalid verification parameters.', 'error')
         return redirect(url_for('admin_dashboard'))
 
-    db = get_db()
-    code = db.execute('SELECT * FROM redeem_codes WHERE id = ?', (code_id,)).fetchone()
-    if not code:
+    doc_ref = db.collection('redeem_codes').document(code_id)
+    doc = doc_ref.get()
+    if not doc.exists:
         flash('Redeem code reference not found.', 'error')
         return redirect(url_for('admin_dashboard'))
 
@@ -1227,20 +1191,20 @@ def admin_approve_code():
             flash('Invalid credit amount entered.', 'error')
             return redirect(url_for('admin_dashboard'))
 
-        db.execute('UPDATE redeem_codes SET status="approved", amount=?, approved_at=CURRENT_TIMESTAMP WHERE id=?',
-                   (amount, code_id))
-        add_credits(code['user_id'], amount)
-        db.commit()
+        doc_ref.update({
+            'status': 'approved',
+            'amount': amount,
+            'approved_at': firestore.SERVER_TIMESTAMP
+        })
+        add_credits(doc.to_dict()['user_id'], amount)
         flash(f'Code approved successfully! Added {amount} credits to the user account.', 'success')
 
     elif action == 'reject':
-        db.execute('UPDATE redeem_codes SET status="rejected" WHERE id=?', (code_id,))
-        db.commit()
+        doc_ref.update({'status': 'rejected'})
         flash('Redeem code request rejected.', 'info')
 
     return redirect(url_for('admin_dashboard'))
 
-# ---------- Remote Integration REST API (Unchanged Infrastructure for Backend compatibility) ----------
 @app.route('/api/send', methods=['POST'])
 def api_send():
     data = request.get_json()
@@ -1270,7 +1234,6 @@ def api_send():
             return jsonify({'error': 'Rate limit exceeded for guests'}), 429
 
     result, error = send_otp_via_api(email, username)
-    db = get_db()
     if error:
         success = 0
         error_msg = error
@@ -1278,23 +1241,28 @@ def api_send():
         success = 1 if result.get('data', {}).get('result') == 0 else 0
         error_msg = result.get('data', {}).get('message') if not success else None
 
-    # Credit deduction occurs ONLY on absolute successful dispatch confirmation
     if success == 1 and user_id:
         if not deduct_credit(user_id):
             return jsonify({'error': 'Transactional ledger update failed'}), 500
 
-    db.execute('''
-        INSERT INTO requests (user_id, email, username, success, error_message, ip_address, user_agent)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
-    ''', (user_id if user_id else None, email, username, success, error_msg, ip, request.headers.get('User-Agent')))
-    db.commit()
+    log_ref = db.collection('requests').document()
+    log_ref.set({
+        'user_id': user_id if user_id else None,
+        'email': email,
+        'username': username,
+        'success': success,
+        'error_message': error_msg,
+        'ip_address': ip,
+        'user_agent': request.headers.get('User-Agent'),
+        'timestamp': firestore.SERVER_TIMESTAMP
+    })
 
     if success:
         return jsonify({'status': 'success', 'message': 'OTP delivery completed successfully.'})
     else:
         return jsonify({'status': 'error', 'message': error_msg or 'Upstream response error'}), 500
 
-# ---------- Server Launch Engine ----------
+# ---------- Server Launch ----------
 if __name__ == '__main__':
     port = int(os.environ.get("PORT", 8080))
     app.run(host='0.0.0.0', port=port, debug=False)
