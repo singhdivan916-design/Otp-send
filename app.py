@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
 """
 Premium OTP Sender – with User Login, Credits, and Redeem Codes.
-Single‑file Flask app with Firebase Firestore for persistent storage.
+Single‑file Flask app with clean, clear moderate language & glass‑morphism UI.
+Firestore persistent storage, all config from .env file.
 """
 
 import os
 import json
+import base64
 import hashlib
 import secrets
 import string
@@ -14,95 +16,194 @@ from functools import wraps
 from flask import Flask, render_template_string, request, jsonify, session, redirect, url_for, flash, g
 import requests
 
-# ---------- Firebase Initialization ----------
+# ---------- Firebase & .env Imports ----------
 import firebase_admin
 from firebase_admin import credentials, firestore
+from dotenv import load_dotenv
 
-# Load Firebase credentials from environment variable (JSON string)
-firebase_creds_json = os.environ.get('FIREBASE_CREDENTIALS')
-if not firebase_creds_json:
-    raise ValueError("FIREBASE_CREDENTIALS environment variable not set")
+# Load environment variables from .env file (must be present)
+load_dotenv()
 
-firebase_creds_dict = json.loads(firebase_creds_json)
-cred = credentials.Certificate(firebase_creds_dict)
-firebase_admin.initialize_app(cred)
-
-db = firestore.client()
-
-# ---------- Configuration ----------
+# ---------- Configuration (all from .env) ----------
 class Config:
-    SECRET_KEY = os.environ.get('SECRET_KEY') or 'dev-secret-key-change-in-production'
-    ADMIN_USERNAME = os.environ.get('ADMIN_USERNAME') or 'admin'
-    ADMIN_PASSWORD = os.environ.get('ADMIN_PASSWORD') or 'changeme'
+    SECRET_KEY = os.environ.get('SECRET_KEY')
+    if not SECRET_KEY:
+        raise RuntimeError("SECRET_KEY not set in .env file")
+
+    ADMIN_USERNAME = os.environ.get('ADMIN_USERNAME')
+    ADMIN_PASSWORD = os.environ.get('ADMIN_PASSWORD')
+    if not ADMIN_USERNAME or not ADMIN_PASSWORD:
+        raise RuntimeError("ADMIN_USERNAME and ADMIN_PASSWORD must be set in .env")
+
     API_KEYS = [k.strip() for k in os.environ.get('API_KEYS', '').split(',') if k.strip()]
-    API_URL = "https://rishu-sso.vercel.app/rishu"
+    API_URL = os.environ.get('API_URL', 'https://rishu-sso.vercel.app/rishu')
     OTP_COST = 1
+
+    # Firebase credentials – can be a path to a JSON file or the JSON content itself
+    FIREBASE_CREDENTIALS = os.environ.get('FIREBASE_CREDENTIALS')
+    if not FIREBASE_CREDENTIALS:
+        raise RuntimeError("FIREBASE_CREDENTIALS not set in .env")
+
+    # Check if it's a file path
+    if os.path.isfile(FIREBASE_CREDENTIALS):
+        cred_path = FIREBASE_CREDENTIALS
+    else:
+        # Try to decode as base64 (for safer .env storage)
+        try:
+            decoded = base64.b64decode(FIREBASE_CREDENTIALS).decode('utf-8')
+            # Write to a temporary file (firebase_admin expects a file)
+            temp_cred_path = '/tmp/firebase_creds.json'
+            with open(temp_cred_path, 'w') as f:
+                f.write(decoded)
+            cred_path = temp_cred_path
+        except Exception:
+            # If not base64, assume it's raw JSON string
+            try:
+                json.loads(FIREBASE_CREDENTIALS)  # validate
+                temp_cred_path = '/tmp/firebase_creds.json'
+                with open(temp_cred_path, 'w') as f:
+                    f.write(FIREBASE_CREDENTIALS)
+                cred_path = temp_cred_path
+            except:
+                raise RuntimeError("FIREBASE_CREDENTIALS must be a file path, base64 JSON, or raw JSON.")
+
+    FIREBASE_CREDENTIALS_PATH = cred_path
 
 app = Flask(__name__)
 app.config.from_object(Config)
 
-# ---------- Helper Functions for Firestore ----------
+# ---------- Firebase Initialization ----------
+cred = credentials.Certificate(app.config['FIREBASE_CREDENTIALS_PATH'])
+firebase_admin.initialize_app(cred)
+db = firestore.client()
+
+# ---------- Counter for auto‑incrementing IDs ----------
+def get_next_id(counter_name):
+    """Atomically increment a counter and return the new value."""
+    counter_ref = db.collection('counters').document(counter_name)
+    @firestore.transactional
+    def increment(transaction):
+        snapshot = transaction.get(counter_ref)
+        if not snapshot.exists:
+            transaction.set(counter_ref, {'value': 1})
+            return 1
+        else:
+            current = snapshot.to_dict().get('value', 0)
+            new_value = current + 1
+            transaction.update(counter_ref, {'value': new_value})
+            return new_value
+    transaction = db.transaction()
+    return increment(transaction)
+
+# ---------- Database Helpers (Firestore replacements) ----------
+
 def get_user_by_id(user_id):
-    doc = db.collection('users').document(str(user_id)).get()
-    if doc.exists:
+    """Return a dict representing a user, or None."""
+    if not isinstance(user_id, int):
+        try:
+            user_id = int(user_id)
+        except:
+            return None
+    docs = db.collection('users').where('id', '==', user_id).limit(1).stream()
+    for doc in docs:
         data = doc.to_dict()
-        data['id'] = doc.id
+        data['id'] = user_id  # ensure id is set
         return data
     return None
 
 def get_user_by_username(username):
-    query = db.collection('users').where('username', '==', username).limit(1).get()
-    for doc in query:
+    docs = db.collection('users').where('username', '==', username).limit(1).stream()
+    for doc in docs:
         data = doc.to_dict()
-        data['id'] = doc.id
+        data['id'] = data.get('id')
         return data
     return None
 
 def get_user_by_email(email):
-    query = db.collection('users').where('email', '==', email).limit(1).get()
-    for doc in query:
+    docs = db.collection('users').where('email', '==', email).limit(1).stream()
+    for doc in docs:
         data = doc.to_dict()
-        data['id'] = doc.id
+        data['id'] = data.get('id')
         return data
     return None
 
 def add_credits(user_id, amount):
-    doc_ref = db.collection('users').document(str(user_id))
-    doc_ref.update({'credits': firestore.Increment(amount)})
+    """Add credits to a user's balance."""
+    docs = db.collection('users').where('id', '==', user_id).limit(1).stream()
+    for doc in docs:
+        ref = doc.reference
+        @firestore.transactional
+        def update_credits(transaction):
+            snapshot = transaction.get(ref)
+            if not snapshot.exists:
+                return False
+            current = snapshot.to_dict().get('credits', 0)
+            transaction.update(ref, {'credits': current + amount})
+            return True
+        transaction = db.transaction()
+        return update_credits(transaction)
+    return False
 
 def deduct_credit(user_id):
-    user = get_user_by_id(user_id)
-    if user and user.get('credits', 0) >= 1:
-        doc_ref = db.collection('users').document(str(user_id))
-        doc_ref.update({'credits': firestore.Increment(-1)})
-        return True
+    """Deduct 1 credit if balance >= 1. Returns True on success."""
+    docs = db.collection('users').where('id', '==', user_id).limit(1).stream()
+    for doc in docs:
+        ref = doc.reference
+        @firestore.transactional
+        def deduct(transaction):
+            snapshot = transaction.get(ref)
+            if not snapshot.exists:
+                return False
+            current = snapshot.to_dict().get('credits', 0)
+            if current >= 1:
+                transaction.update(ref, {'credits': current - 1})
+                return True
+            return False
+        transaction = db.transaction()
+        return deduct(transaction)
     return False
 
 def check_rate_limit(ip):
-    doc_ref = db.collection('rate_limits').document(ip)
-    doc = doc_ref.get()
+    """Increment rate limit counter for IP; return True if under limit."""
     now = datetime.now(timezone.utc)
-    if doc.exists:
-        data = doc.to_dict()
-        reset_time = data.get('reset_time')
-        if reset_time and reset_time < now:
-            doc_ref.set({
-                'count': 1,
-                'reset_time': now + timedelta(hours=1)
-            })
+    ref = db.collection('rate_limits').document(ip)
+    @firestore.transactional
+    def check_and_update(transaction):
+        snapshot = transaction.get(ref)
+        if not snapshot.exists:
+            reset_time = now + timedelta(hours=1)
+            transaction.set(ref, {'count': 1, 'reset_time': reset_time})
             return True
         else:
-            if data.get('count', 0) >= 5:
-                return False
-            else:
-                doc_ref.update({'count': firestore.Increment(1)})
+            data = snapshot.to_dict()
+            reset_time = data.get('reset_time')
+            if reset_time and reset_time < now:
+                new_reset = now + timedelta(hours=1)
+                transaction.set(ref, {'count': 1, 'reset_time': new_reset})
                 return True
-    else:
-        doc_ref.set({
-            'count': 1,
-            'reset_time': now + timedelta(hours=1)
-        })
-        return True
+            else:
+                count = data.get('count', 0)
+                if count >= 5:
+                    return False
+                else:
+                    transaction.update(ref, {'count': count + 1})
+                    return True
+    transaction = db.transaction()
+    return check_and_update(transaction)
+
+def create_user(username, email, password_hash, credits=1):
+    """Create a new user document with auto‑incrementing id."""
+    user_id = get_next_id('users')
+    user_data = {
+        'id': user_id,
+        'username': username,
+        'email': email,
+        'password_hash': password_hash,
+        'credits': credits,
+        'created_at': firestore.SERVER_TIMESTAMP
+    }
+    db.collection('users').document(str(user_id)).set(user_data)
+    return user_id
 
 # ---------- Password Helpers ----------
 def hash_password(password):
@@ -144,7 +245,7 @@ def admin_required(f):
         return f(*args, **kwargs)
     return decorated
 
-# ---------- Master Shell View UI Template ----------
+# ---------- Master Shell View UI Template (unchanged) ----------
 BASE_HTML = '''
 <!DOCTYPE html>
 <html lang="en">
@@ -339,7 +440,7 @@ BASE_HTML = '''
 </html>
 '''
 
-# ---------- Web Content Blueprint Sub-Templates ----------
+# ---------- Web Content Sub-Templates (unchanged) ----------
 LANDING_CONTENT = '''
 <div class="space-y-20 py-6" data-aos="fade-up">
     <div class="text-center max-w-4xl mx-auto space-y-6 pt-4">
@@ -917,7 +1018,8 @@ def render_page(content_template, title="OTP Matrix", **context):
         user = get_user_by_id(session['user_id'])
     return render_template_string(BASE_HTML, title=title, content=content_rendered, user=user)
 
-# ---------- Dynamic Route Management Engine ----------
+# ---------- Route Definitions (unchanged logic, only database calls replaced) ----------
+
 @app.route('/')
 def home():
     return render_page(LANDING_CONTENT, title="Home – Fast OTP Service")
@@ -958,8 +1060,8 @@ def send_otp():
         if not deduct_credit(user['id']):
             return jsonify({'success': False, 'message': 'Failed to complete credit update.'}), 500
 
-    log_ref = db.collection('requests').document()
-    log_ref.set({
+    # Log the request in Firestore
+    request_data = {
         'user_id': user['id'],
         'email': email,
         'username': username,
@@ -968,7 +1070,8 @@ def send_otp():
         'ip_address': ip,
         'user_agent': request.headers.get('User-Agent'),
         'timestamp': firestore.SERVER_TIMESTAMP
-    })
+    }
+    db.collection('requests').add(request_data)
 
     updated_user = get_user_by_id(user['id'])
     current_credits = updated_user['credits'] if updated_user else 0
@@ -1004,16 +1107,12 @@ def register():
             return render_page(REGISTER_CONTENT, title="Register Account")
 
         hashed = hash_password(password)
-        new_user_ref = db.collection('users').document()
-        new_user_ref.set({
-            'username': username,
-            'email': email,
-            'password_hash': hashed,
-            'credits': 1,
-            'created_at': firestore.SERVER_TIMESTAMP
-        })
-        flash('Account created successfully! You received 1 free credit. Please log in.', 'success')
-        return redirect(url_for('login'))
+        try:
+            create_user(username, email, hashed, credits=1)
+            flash('Account created successfully! You received 1 free credit. Please log in.', 'success')
+            return redirect(url_for('login'))
+        except Exception as e:
+            flash(f'Registration failed: {str(e)}', 'error')
 
     return render_page(REGISTER_CONTENT, title="Register Account")
 
@@ -1054,13 +1153,20 @@ def profile():
         flash('User account error.', 'error')
         return redirect(url_for('logout'))
 
-    query = db.collection('requests').where('user_id', '==', user['id']).order_by('timestamp', direction=firestore.Query.DESCENDING).limit(20).get()
+    # Get recent requests for this user
+    requests_ref = db.collection('requests').where('user_id', '==', user['id']).order_by('timestamp', direction=firestore.Query.DESCENDING).limit(20)
     requests_logs = []
-    for doc in query:
+    for doc in requests_ref.stream():
         data = doc.to_dict()
-        if 'timestamp' in data and data['timestamp']:
-            data['timestamp'] = data['timestamp'].strftime('%Y-%m-%d %H:%M:%S') if hasattr(data['timestamp'], 'strftime') else str(data['timestamp'])
-        requests_logs.append(data)
+        # Convert timestamp to string if it's a datetime object
+        ts = data.get('timestamp')
+        if hasattr(ts, 'strftime'):
+            ts = ts.strftime('%Y-%m-%d %H:%M:%S')
+        requests_logs.append({
+            'email': data.get('email'),
+            'success': data.get('success'),
+            'timestamp': ts
+        })
 
     return render_page(PROFILE_CONTENT, title="My Profile", user=user, requests=requests_logs)
 
@@ -1081,30 +1187,29 @@ def redeem():
     if expected_amount <= 0:
         return jsonify({'success': False, 'message': 'Please select a valid package.'}), 400
 
-    query = db.collection('redeem_codes').where('code', '==', code).limit(1).get()
-    existing = None
-    for doc in query:
-        existing = doc.to_dict()
-        existing['id'] = doc.id
-        break
-
-    if existing:
-        if existing['status'] == 'approved':
+    # Check if code already exists
+    existing = db.collection('redeem_codes').where('code', '==', code).limit(1).stream()
+    for doc in existing:
+        data = doc.to_dict()
+        if data['status'] == 'approved':
             return jsonify({'success': False, 'message': 'This redeem code has already been used.'}), 400
-        elif existing['status'] == 'rejected':
+        elif data['status'] == 'rejected':
             return jsonify({'success': False, 'message': 'This redeem code has expired or was rejected.'}), 400
         else:
             return jsonify({'success': True, 'message': 'This code is already under review.'})
-    else:
-        new_code_ref = db.collection('redeem_codes').document()
-        new_code_ref.set({
-            'code': code,
-            'user_id': session['user_id'],
-            'amount': expected_amount,
-            'status': 'pending',
-            'requested_at': firestore.SERVER_TIMESTAMP
-        })
-        return jsonify({'success': True, 'message': 'Code submitted successfully! Credits will be added once approved.'})
+
+    # Insert new redeem code
+    redeem_data = {
+        'code': code,
+        'user_id': session['user_id'],
+        'amount': expected_amount,
+        'status': 'pending',
+        'requested_at': firestore.SERVER_TIMESTAMP,
+        'approved_at': None,
+        'admin_notes': None
+    }
+    db.collection('redeem_codes').add(redeem_data)
+    return jsonify({'success': True, 'message': 'Code submitted successfully! Credits will be added once approved.'})
 
 @app.route('/admin/login', methods=['GET', 'POST'])
 def admin_login():
@@ -1132,36 +1237,55 @@ def admin_logout():
 @app.route('/admin')
 @admin_required
 def admin_dashboard():
-    users_count = len(db.collection('users').get())
-    success_otp = len(db.collection('requests').where('success', '==', 1).get())
-    failed_otp = len(db.collection('requests').where('success', '==', 0).get())
-    pending_redeems = len(db.collection('redeem_codes').where('status', '==', 'pending').get())
+    # Counts
+    total_users = len(list(db.collection('users').stream()))
+    success_otp = len(list(db.collection('requests').where('success', '==', 1).stream()))
+    failed_otp = len(list(db.collection('requests').where('success', '==', 0).stream()))
+    pending_redeems = len(list(db.collection('redeem_codes').where('status', '==', 'pending').stream()))
 
-    pending_codes_query = db.collection('redeem_codes').where('status', '==', 'pending').get()
+    # Pending redeem codes with user details
     pending_codes = []
-    for doc in pending_codes_query:
+    for doc in db.collection('redeem_codes').where('status', '==', 'pending').order_by('requested_at').stream():
         data = doc.to_dict()
-        data['id'] = doc.id
-        user = get_user_by_id(data['user_id'])
-        data['username'] = user['username'] if user else 'Unknown'
-        pending_codes.append(data)
+        # Fetch username for user_id
+        user_docs = db.collection('users').where('id', '==', data['user_id']).limit(1).stream()
+        username = None
+        for u in user_docs:
+            username = u.to_dict().get('username')
+        pending_codes.append({
+            'id': doc.id,
+            'code': data['code'],
+            'user_id': data['user_id'],
+            'amount': data['amount'],
+            'username': username,
+            'requested_at': data.get('requested_at')
+        })
 
-    logs_query = db.collection('requests').order_by('timestamp', direction=firestore.Query.DESCENDING).limit(50).get()
+    # Recent logs (last 50)
     logs = []
-    for doc in logs_query:
+    for doc in db.collection('requests').order_by('timestamp', direction=firestore.Query.DESCENDING).limit(50).stream():
         data = doc.to_dict()
-        data['id'] = doc.id
-        if 'timestamp' in data and data['timestamp']:
-            data['timestamp'] = data['timestamp'].strftime('%Y-%m-%d %H:%M:%S') if hasattr(data['timestamp'], 'strftime') else str(data['timestamp'])
+        ts = data.get('timestamp')
+        if hasattr(ts, 'strftime'):
+            ts = ts.strftime('%Y-%m-%d %H:%M:%S')
+        # Get username if user_id exists
+        username = None
         if data.get('user_id'):
-            user = get_user_by_id(data['user_id'])
-            data['username'] = user['username'] if user else None
-        else:
-            data['username'] = None
-        logs.append(data)
+            user_docs = db.collection('users').where('id', '==', data['user_id']).limit(1).stream()
+            for u in user_docs:
+                username = u.to_dict().get('username')
+        logs.append({
+            'id': doc.id[:8],  # short id
+            'email': data.get('email'),
+            'success': data.get('success'),
+            'error_message': data.get('error_message'),
+            'ip_address': data.get('ip_address'),
+            'timestamp': ts,
+            'username': username
+        })
 
     return render_page(ADMIN_DASHBOARD_CONTENT, title="Admin Command Center",
-                       total_users=users_count, success_otp=success_otp, failed_otp=failed_otp,
+                       total_users=total_users, success_otp=success_otp, failed_otp=failed_otp,
                        pending_redeems=pending_redeems, pending_codes=pending_codes, logs=logs)
 
 @app.route('/admin/approve-code', methods=['POST'])
@@ -1175,12 +1299,14 @@ def admin_approve_code():
         flash('Invalid verification parameters.', 'error')
         return redirect(url_for('admin_dashboard'))
 
+    # Get the redeem code document by its Firestore doc ID
     doc_ref = db.collection('redeem_codes').document(code_id)
     doc = doc_ref.get()
     if not doc.exists:
         flash('Redeem code reference not found.', 'error')
         return redirect(url_for('admin_dashboard'))
 
+    code_data = doc.to_dict()
     if action == 'approve':
         try:
             amount = int(amount)
@@ -1191,12 +1317,14 @@ def admin_approve_code():
             flash('Invalid credit amount entered.', 'error')
             return redirect(url_for('admin_dashboard'))
 
+        # Update status and amount
         doc_ref.update({
             'status': 'approved',
             'amount': amount,
             'approved_at': firestore.SERVER_TIMESTAMP
         })
-        add_credits(doc.to_dict()['user_id'], amount)
+        # Add credits to user
+        add_credits(code_data['user_id'], amount)
         flash(f'Code approved successfully! Added {amount} credits to the user account.', 'success')
 
     elif action == 'reject':
@@ -1245,9 +1373,9 @@ def api_send():
         if not deduct_credit(user_id):
             return jsonify({'error': 'Transactional ledger update failed'}), 500
 
-    log_ref = db.collection('requests').document()
-    log_ref.set({
-        'user_id': user_id if user_id else None,
+    # Log request
+    log_data = {
+        'user_id': user_id,
         'email': email,
         'username': username,
         'success': success,
@@ -1255,7 +1383,8 @@ def api_send():
         'ip_address': ip,
         'user_agent': request.headers.get('User-Agent'),
         'timestamp': firestore.SERVER_TIMESTAMP
-    })
+    }
+    db.collection('requests').add(log_data)
 
     if success:
         return jsonify({'status': 'success', 'message': 'OTP delivery completed successfully.'})
