@@ -2,7 +2,7 @@
 """
 Premium OTP Sender – with User Login, Credits, and Redeem Codes.
 Single‑file Flask app with clean, clear moderate language & glass‑morphism UI.
-Firestore persistent storage, all config from .env file.
+Optimized for speed: Firestore direct gets, session caching, lazy Firebase init.
 """
 
 import os
@@ -21,7 +21,7 @@ import firebase_admin
 from firebase_admin import credentials, firestore
 from dotenv import load_dotenv
 
-# Load environment variables from .env file (must be present)
+# Load environment variables from .env file
 load_dotenv()
 
 # ---------- Configuration (all from .env) ----------
@@ -35,29 +35,29 @@ class Config:
     if not ADMIN_USERNAME or not ADMIN_PASSWORD:
         raise RuntimeError("ADMIN_USERNAME and ADMIN_PASSWORD must be set in .env")
 
+    # API_KEYS is optional – if not present, the /api/send endpoint will reject all calls
     API_KEYS = [k.strip() for k in os.environ.get('API_KEYS', '').split(',') if k.strip()]
     API_URL = os.environ.get('API_URL', 'https://rishu-sso.vercel.app/rishu')
     OTP_COST = 1
 
-    # Firebase credentials – can be a path to a JSON file or the JSON content itself
+    # Firebase credentials – can be file path, base64 JSON, or raw JSON string
     FIREBASE_CREDENTIALS = os.environ.get('FIREBASE_CREDENTIALS')
     if not FIREBASE_CREDENTIALS:
         raise RuntimeError("FIREBASE_CREDENTIALS not set in .env")
 
-    # Check if it's a file path
+    # Determine if it's a file path
     if os.path.isfile(FIREBASE_CREDENTIALS):
         cred_path = FIREBASE_CREDENTIALS
     else:
-        # Try to decode as base64 (for safer .env storage)
+        # Try base64 decode
         try:
             decoded = base64.b64decode(FIREBASE_CREDENTIALS).decode('utf-8')
-            # Write to a temporary file (firebase_admin expects a file)
             temp_cred_path = '/tmp/firebase_creds.json'
             with open(temp_cred_path, 'w') as f:
                 f.write(decoded)
             cred_path = temp_cred_path
         except Exception:
-            # If not base64, assume it's raw JSON string
+            # Assume raw JSON string
             try:
                 json.loads(FIREBASE_CREDENTIALS)  # validate
                 temp_cred_path = '/tmp/firebase_creds.json'
@@ -72,14 +72,22 @@ class Config:
 app = Flask(__name__)
 app.config.from_object(Config)
 
-# ---------- Firebase Initialization ----------
-cred = credentials.Certificate(app.config['FIREBASE_CREDENTIALS_PATH'])
-firebase_admin.initialize_app(cred)
-db = firestore.client()
+# ---------- Lazy Firebase Initialization ----------
+_firestore_client = None
+
+def get_firestore():
+    """Initialize Firebase Admin SDK once and return Firestore client."""
+    global _firestore_client
+    if _firestore_client is None:
+        cred = credentials.Certificate(app.config['FIREBASE_CREDENTIALS_PATH'])
+        firebase_admin.initialize_app(cred)
+        _firestore_client = firestore.client()
+    return _firestore_client
 
 # ---------- Counter for auto‑incrementing IDs ----------
 def get_next_id(counter_name):
     """Atomically increment a counter and return the new value."""
+    db = get_firestore()
     counter_ref = db.collection('counters').document(counter_name)
     @firestore.transactional
     def increment(transaction):
@@ -95,23 +103,26 @@ def get_next_id(counter_name):
     transaction = db.transaction()
     return increment(transaction)
 
-# ---------- Database Helpers (Firestore replacements) ----------
+# ---------- Database Helpers (Optimized) ----------
 
 def get_user_by_id(user_id):
-    """Return a dict representing a user, or None."""
+    """Return a dict representing a user, using direct document fetch."""
     if not isinstance(user_id, int):
         try:
             user_id = int(user_id)
         except:
             return None
-    docs = db.collection('users').where('id', '==', user_id).limit(1).stream()
-    for doc in docs:
+    db = get_firestore()
+    doc_ref = db.collection('users').document(str(user_id))
+    doc = doc_ref.get()
+    if doc.exists:
         data = doc.to_dict()
-        data['id'] = user_id  # ensure id is set
+        data['id'] = user_id
         return data
     return None
 
 def get_user_by_username(username):
+    db = get_firestore()
     docs = db.collection('users').where('username', '==', username).limit(1).stream()
     for doc in docs:
         data = doc.to_dict()
@@ -120,6 +131,7 @@ def get_user_by_username(username):
     return None
 
 def get_user_by_email(email):
+    db = get_firestore()
     docs = db.collection('users').where('email', '==', email).limit(1).stream()
     for doc in docs:
         data = doc.to_dict()
@@ -129,6 +141,7 @@ def get_user_by_email(email):
 
 def add_credits(user_id, amount):
     """Add credits to a user's balance."""
+    db = get_firestore()
     docs = db.collection('users').where('id', '==', user_id).limit(1).stream()
     for doc in docs:
         ref = doc.reference
@@ -146,6 +159,7 @@ def add_credits(user_id, amount):
 
 def deduct_credit(user_id):
     """Deduct 1 credit if balance >= 1. Returns True on success."""
+    db = get_firestore()
     docs = db.collection('users').where('id', '==', user_id).limit(1).stream()
     for doc in docs:
         ref = doc.reference
@@ -165,6 +179,7 @@ def deduct_credit(user_id):
 
 def check_rate_limit(ip):
     """Increment rate limit counter for IP; return True if under limit."""
+    db = get_firestore()
     now = datetime.now(timezone.utc)
     ref = db.collection('rate_limits').document(ip)
     @firestore.transactional
@@ -193,6 +208,7 @@ def check_rate_limit(ip):
 
 def create_user(username, email, password_hash, credits=1):
     """Create a new user document with auto‑incrementing id."""
+    db = get_firestore()
     user_id = get_next_id('users')
     user_data = {
         'id': user_id,
@@ -1010,15 +1026,29 @@ ADMIN_LOGIN_CONTENT = '''
 </div>
 '''
 
-# ---------- Page Assembler Helper ----------
+# ---------- Page Assembler Helper (uses session cache) ----------
 def render_page(content_template, title="OTP Matrix", **context):
-    content_rendered = render_template_string(content_template, **context)
+    """Render the page with user data from session if available, else from Firestore."""
     user = None
     if session.get('user_id'):
-        user = get_user_by_id(session['user_id'])
+        # Use session cache if present, else fetch from DB and cache
+        if 'user_credits' in session and 'username' in session:
+            user = {
+                'id': session['user_id'],
+                'username': session.get('username'),
+                'email': session.get('user_email'),
+                'credits': session.get('user_credits', 0)
+            }
+        else:
+            user = get_user_by_id(session['user_id'])
+            if user:
+                session['user_credits'] = user.get('credits', 0)
+                session['username'] = user.get('username')
+                session['user_email'] = user.get('email')
+    content_rendered = render_template_string(content_template, **context)
     return render_template_string(BASE_HTML, title=title, content=content_rendered, user=user)
 
-# ---------- Route Definitions (unchanged logic, only database calls replaced) ----------
+# ---------- Route Definitions (with session cache updates) ----------
 
 @app.route('/')
 def home():
@@ -1027,8 +1057,17 @@ def home():
 @app.route('/dashboard')
 @login_required
 def dashboard():
-    user = get_user_by_id(session['user_id'])
-    return render_page(DASHBOARD_CONTENT, title="Dashboard Console", credits=user['credits'] if user else 0)
+    # Refresh credits from session or DB
+    user = None
+    if session.get('user_id'):
+        if 'user_credits' in session:
+            user = {'credits': session['user_credits']}
+        else:
+            user = get_user_by_id(session['user_id'])
+            if user:
+                session['user_credits'] = user.get('credits', 0)
+    credits = user['credits'] if user else 0
+    return render_page(DASHBOARD_CONTENT, title="Dashboard Console", credits=credits)
 
 @app.route('/send-otp', methods=['POST'])
 @login_required
@@ -1061,6 +1100,7 @@ def send_otp():
             return jsonify({'success': False, 'message': 'Failed to complete credit update.'}), 500
 
     # Log the request in Firestore
+    db = get_firestore()
     request_data = {
         'user_id': user['id'],
         'email': email,
@@ -1073,13 +1113,15 @@ def send_otp():
     }
     db.collection('requests').add(request_data)
 
+    # Update session credit after successful deduction
     updated_user = get_user_by_id(user['id'])
-    current_credits = updated_user['credits'] if updated_user else 0
+    if updated_user:
+        session['user_credits'] = updated_user['credits']
 
     if success == 1:
-        return jsonify({'success': True, 'message': 'OTP sent successfully!', 'credits': current_credits})
+        return jsonify({'success': True, 'message': 'OTP sent successfully!', 'credits': session['user_credits']})
     else:
-        return jsonify({'success': False, 'message': f"Server error: {error_msg or 'Failed to process request.'}", 'credits': current_credits})
+        return jsonify({'success': False, 'message': f"Server error: {error_msg or 'Failed to process request.'}", 'credits': session['user_credits']})
 
 @app.route('/register', methods=['GET', 'POST'])
 def register():
@@ -1133,7 +1175,11 @@ def login():
             flash('Invalid email or password.', 'error')
             return render_page(LOGIN_CONTENT, title="Login")
 
+        # Store user data in session
         session['user_id'] = user['id']
+        session['user_credits'] = user['credits']
+        session['username'] = user['username']
+        session['user_email'] = user['email']
         flash('Logged in successfully. Welcome back!', 'success')
         return redirect(url_for('dashboard'))
 
@@ -1141,24 +1187,27 @@ def login():
 
 @app.route('/logout')
 def logout():
-    session.pop('user_id', None)
+    session.clear()
     flash('Logged out successfully.', 'info')
     return redirect(url_for('home'))
 
 @app.route('/profile')
 @login_required
 def profile():
+    # Refresh user data from DB (credits may have changed)
     user = get_user_by_id(session['user_id'])
     if not user:
         flash('User account error.', 'error')
         return redirect(url_for('logout'))
+    # Update session cache
+    session['user_credits'] = user['credits']
 
     # Get recent requests for this user
+    db = get_firestore()
     requests_ref = db.collection('requests').where('user_id', '==', user['id']).order_by('timestamp', direction=firestore.Query.DESCENDING).limit(20)
     requests_logs = []
     for doc in requests_ref.stream():
         data = doc.to_dict()
-        # Convert timestamp to string if it's a datetime object
         ts = data.get('timestamp')
         if hasattr(ts, 'strftime'):
             ts = ts.strftime('%Y-%m-%d %H:%M:%S')
@@ -1187,6 +1236,7 @@ def redeem():
     if expected_amount <= 0:
         return jsonify({'success': False, 'message': 'Please select a valid package.'}), 400
 
+    db = get_firestore()
     # Check if code already exists
     existing = db.collection('redeem_codes').where('code', '==', code).limit(1).stream()
     for doc in existing:
@@ -1237,7 +1287,7 @@ def admin_logout():
 @app.route('/admin')
 @admin_required
 def admin_dashboard():
-    # Counts
+    db = get_firestore()
     total_users = len(list(db.collection('users').stream()))
     success_otp = len(list(db.collection('requests').where('success', '==', 1).stream()))
     failed_otp = len(list(db.collection('requests').where('success', '==', 0).stream()))
@@ -1275,7 +1325,7 @@ def admin_dashboard():
             for u in user_docs:
                 username = u.to_dict().get('username')
         logs.append({
-            'id': doc.id[:8],  # short id
+            'id': doc.id[:8],
             'email': data.get('email'),
             'success': data.get('success'),
             'error_message': data.get('error_message'),
@@ -1299,7 +1349,7 @@ def admin_approve_code():
         flash('Invalid verification parameters.', 'error')
         return redirect(url_for('admin_dashboard'))
 
-    # Get the redeem code document by its Firestore doc ID
+    db = get_firestore()
     doc_ref = db.collection('redeem_codes').document(code_id)
     doc = doc_ref.get()
     if not doc.exists:
@@ -1317,14 +1367,17 @@ def admin_approve_code():
             flash('Invalid credit amount entered.', 'error')
             return redirect(url_for('admin_dashboard'))
 
-        # Update status and amount
         doc_ref.update({
             'status': 'approved',
             'amount': amount,
             'approved_at': firestore.SERVER_TIMESTAMP
         })
-        # Add credits to user
         add_credits(code_data['user_id'], amount)
+        # Update session credit if the user is the current one
+        if session.get('user_id') == code_data['user_id']:
+            user = get_user_by_id(session['user_id'])
+            if user:
+                session['user_credits'] = user['credits']
         flash(f'Code approved successfully! Added {amount} credits to the user account.', 'success')
 
     elif action == 'reject':
@@ -1373,7 +1426,7 @@ def api_send():
         if not deduct_credit(user_id):
             return jsonify({'error': 'Transactional ledger update failed'}), 500
 
-    # Log request
+    db = get_firestore()
     log_data = {
         'user_id': user_id,
         'email': email,
