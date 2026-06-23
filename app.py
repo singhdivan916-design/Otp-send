@@ -1,225 +1,123 @@
 #!/usr/bin/env python3
 """
 Premium OTP Sender – with User Login, Credits, and Redeem Codes.
-Single‑file Flask app with clean, clear moderate language & glass‑morphism UI.
-Optimized for speed: Firestore direct gets, session caching, lazy Firebase init.
+Uses Supabase (PostgreSQL) as the database.
 """
 
 import os
-import json
-import base64
 import hashlib
-import secrets
-import string
 from datetime import datetime, timezone, timedelta
 from functools import wraps
-from flask import Flask, render_template_string, request, jsonify, session, redirect, url_for, flash, g
+from flask import Flask, render_template_string, request, jsonify, session, redirect, url_for, flash
 import requests
-
-# ---------- Firebase & .env Imports ----------
-import firebase_admin
-from firebase_admin import credentials, firestore
 from dotenv import load_dotenv
+from supabase import create_client, Client
 
-# Load environment variables from .env file
 load_dotenv()
 
-# ---------- Configuration (all from .env) ----------
+# ---------- Configuration ----------
 class Config:
     SECRET_KEY = os.environ.get('SECRET_KEY')
     if not SECRET_KEY:
-        raise RuntimeError("SECRET_KEY not set in .env file")
+        raise RuntimeError("SECRET_KEY not set")
 
     ADMIN_USERNAME = os.environ.get('ADMIN_USERNAME')
     ADMIN_PASSWORD = os.environ.get('ADMIN_PASSWORD')
     if not ADMIN_USERNAME or not ADMIN_PASSWORD:
-        raise RuntimeError("ADMIN_USERNAME and ADMIN_PASSWORD must be set in .env")
+        raise RuntimeError("ADMIN credentials missing")
 
-    # API_KEYS is optional – if not present, the /api/send endpoint will reject all calls
+    SUPABASE_URL = os.environ.get('SUPABASE_URL')
+    SUPABASE_KEY = os.environ.get('SUPABASE_KEY')
+    if not SUPABASE_URL or not SUPABASE_KEY:
+        raise RuntimeError("SUPABASE_URL and SUPABASE_KEY required")
+
     API_KEYS = [k.strip() for k in os.environ.get('API_KEYS', '').split(',') if k.strip()]
     API_URL = os.environ.get('API_URL', 'https://rishu-sso.vercel.app/rishu')
     OTP_COST = 1
 
-    # Firebase credentials – can be file path, base64 JSON, or raw JSON string
-    FIREBASE_CREDENTIALS = os.environ.get('FIREBASE_CREDENTIALS')
-    if not FIREBASE_CREDENTIALS:
-        raise RuntimeError("FIREBASE_CREDENTIALS not set in .env")
-
-    # Determine if it's a file path
-    if os.path.isfile(FIREBASE_CREDENTIALS):
-        cred_path = FIREBASE_CREDENTIALS
-    else:
-        # Try base64 decode
-        try:
-            decoded = base64.b64decode(FIREBASE_CREDENTIALS).decode('utf-8')
-            temp_cred_path = '/tmp/firebase_creds.json'
-            with open(temp_cred_path, 'w') as f:
-                f.write(decoded)
-            cred_path = temp_cred_path
-        except Exception:
-            # Assume raw JSON string
-            try:
-                json.loads(FIREBASE_CREDENTIALS)  # validate
-                temp_cred_path = '/tmp/firebase_creds.json'
-                with open(temp_cred_path, 'w') as f:
-                    f.write(FIREBASE_CREDENTIALS)
-                cred_path = temp_cred_path
-            except:
-                raise RuntimeError("FIREBASE_CREDENTIALS must be a file path, base64 JSON, or raw JSON.")
-
-    FIREBASE_CREDENTIALS_PATH = cred_path
-
 app = Flask(__name__)
 app.config.from_object(Config)
 
-# ---------- Lazy Firebase Initialization ----------
-_firestore_client = None
+# ---------- Supabase Client ----------
+supabase: Client = create_client(
+    app.config['SUPABASE_URL'],
+    app.config['SUPABASE_KEY']
+)
 
-def get_firestore():
-    """Initialize Firebase Admin SDK once and return Firestore client."""
-    global _firestore_client
-    if _firestore_client is None:
-        cred = credentials.Certificate(app.config['FIREBASE_CREDENTIALS_PATH'])
-        firebase_admin.initialize_app(cred)
-        _firestore_client = firestore.client()
-    return _firestore_client
-
-# ---------- Counter for auto‑incrementing IDs ----------
-def get_next_id(counter_name):
-    """Atomically increment a counter and return the new value."""
-    db = get_firestore()
-    counter_ref = db.collection('counters').document(counter_name)
-    @firestore.transactional
-    def increment(transaction):
-        snapshot = transaction.get(counter_ref)
-        if not snapshot.exists:
-            transaction.set(counter_ref, {'value': 1})
-            return 1
-        else:
-            current = snapshot.to_dict().get('value', 0)
-            new_value = current + 1
-            transaction.update(counter_ref, {'value': new_value})
-            return new_value
-    transaction = db.transaction()
-    return increment(transaction)
-
-# ---------- Database Helpers (Optimized) ----------
+# ---------- Database Helpers ----------
 
 def get_user_by_id(user_id):
-    """Return a dict representing a user, using direct document fetch."""
-    if not isinstance(user_id, int):
-        try:
-            user_id = int(user_id)
-        except:
-            return None
-    db = get_firestore()
-    doc_ref = db.collection('users').document(str(user_id))
-    doc = doc_ref.get()
-    if doc.exists:
-        data = doc.to_dict()
-        data['id'] = user_id
-        return data
-    return None
+    try:
+        user_id = int(user_id)
+    except:
+        return None
+    resp = supabase.table('users').select('*').eq('id', user_id).execute()
+    return resp.data[0] if resp.data else None
 
 def get_user_by_username(username):
-    db = get_firestore()
-    docs = db.collection('users').where('username', '==', username).limit(1).stream()
-    for doc in docs:
-        data = doc.to_dict()
-        data['id'] = data.get('id')
-        return data
-    return None
+    resp = supabase.table('users').select('*').eq('username', username).execute()
+    return resp.data[0] if resp.data else None
 
 def get_user_by_email(email):
-    db = get_firestore()
-    docs = db.collection('users').where('email', '==', email).limit(1).stream()
-    for doc in docs:
-        data = doc.to_dict()
-        data['id'] = data.get('id')
-        return data
-    return None
+    resp = supabase.table('users').select('*').eq('email', email).execute()
+    return resp.data[0] if resp.data else None
 
 def add_credits(user_id, amount):
-    """Add credits to a user's balance."""
-    db = get_firestore()
-    docs = db.collection('users').where('id', '==', user_id).limit(1).stream()
-    for doc in docs:
-        ref = doc.reference
-        @firestore.transactional
-        def update_credits(transaction):
-            snapshot = transaction.get(ref)
-            if not snapshot.exists:
-                return False
-            current = snapshot.to_dict().get('credits', 0)
-            transaction.update(ref, {'credits': current + amount})
-            return True
-        transaction = db.transaction()
-        return update_credits(transaction)
-    return False
+    user = get_user_by_id(user_id)
+    if not user:
+        return False
+    new_credits = user['credits'] + amount
+    resp = supabase.table('users').update({'credits': new_credits}).eq('id', user_id).execute()
+    return bool(resp.data)
 
 def deduct_credit(user_id):
-    """Deduct 1 credit if balance >= 1. Returns True on success."""
-    db = get_firestore()
-    docs = db.collection('users').where('id', '==', user_id).limit(1).stream()
-    for doc in docs:
-        ref = doc.reference
-        @firestore.transactional
-        def deduct(transaction):
-            snapshot = transaction.get(ref)
-            if not snapshot.exists:
-                return False
-            current = snapshot.to_dict().get('credits', 0)
-            if current >= 1:
-                transaction.update(ref, {'credits': current - 1})
-                return True
-            return False
-        transaction = db.transaction()
-        return deduct(transaction)
-    return False
-
-def check_rate_limit(ip):
-    """Increment rate limit counter for IP; return True if under limit."""
-    db = get_firestore()
-    now = datetime.now(timezone.utc)
-    ref = db.collection('rate_limits').document(ip)
-    @firestore.transactional
-    def check_and_update(transaction):
-        snapshot = transaction.get(ref)
-        if not snapshot.exists:
-            reset_time = now + timedelta(hours=1)
-            transaction.set(ref, {'count': 1, 'reset_time': reset_time})
-            return True
-        else:
-            data = snapshot.to_dict()
-            reset_time = data.get('reset_time')
-            if reset_time and reset_time < now:
-                new_reset = now + timedelta(hours=1)
-                transaction.set(ref, {'count': 1, 'reset_time': new_reset})
-                return True
-            else:
-                count = data.get('count', 0)
-                if count >= 5:
-                    return False
-                else:
-                    transaction.update(ref, {'count': count + 1})
-                    return True
-    transaction = db.transaction()
-    return check_and_update(transaction)
+    user = get_user_by_id(user_id)
+    if not user or user['credits'] < 1:
+        return False
+    new_credits = user['credits'] - 1
+    resp = supabase.table('users').update({'credits': new_credits}).eq('id', user_id).execute()
+    return bool(resp.data)
 
 def create_user(username, email, password_hash, credits=1):
-    """Create a new user document with auto‑incrementing id."""
-    db = get_firestore()
-    user_id = get_next_id('users')
-    user_data = {
-        'id': user_id,
+    data = {
         'username': username,
         'email': email,
         'password_hash': password_hash,
-        'credits': credits,
-        'created_at': firestore.SERVER_TIMESTAMP
+        'credits': credits
     }
-    db.collection('users').document(str(user_id)).set(user_data)
-    return user_id
+    resp = supabase.table('users').insert(data).execute()
+    if resp.data:
+        return resp.data[0]['id']
+    return None
+
+def check_rate_limit(ip):
+    now = datetime.now(timezone.utc)
+    resp = supabase.table('rate_limits').select('*').eq('ip', ip).execute()
+    if not resp.data:
+        reset_time = now + timedelta(hours=1)
+        supabase.table('rate_limits').insert({
+            'ip': ip,
+            'count': 1,
+            'reset_time': reset_time.isoformat()
+        }).execute()
+        return True
+    else:
+        record = resp.data[0]
+        reset_time = record.get('reset_time')
+        if reset_time and datetime.fromisoformat(reset_time.replace('Z', '+00:00')) < now:
+            new_reset = now + timedelta(hours=1)
+            supabase.table('rate_limits').update({
+                'count': 1,
+                'reset_time': new_reset.isoformat()
+            }).eq('ip', ip).execute()
+            return True
+        else:
+            count = record.get('count', 0)
+            if count >= 5:
+                return False
+            else:
+                supabase.table('rate_limits').update({'count': count + 1}).eq('ip', ip).execute()
+                return True
 
 # ---------- Password Helpers ----------
 def hash_password(password):
@@ -228,7 +126,7 @@ def hash_password(password):
 def verify_password(password, hash_val):
     return hash_password(password) == hash_val
 
-# ---------- Upstream API Call ----------
+# ---------- Upstream API ----------
 def send_otp_via_api(email, username=None):
     payload = {"email": email}
     if username:
@@ -242,12 +140,12 @@ def send_otp_via_api(email, username=None):
     except Exception as e:
         return None, str(e)
 
-# ---------- Security Decorators ----------
+# ---------- Decorators ----------
 def login_required(f):
     @wraps(f)
     def decorated(*args, **kwargs):
         if not session.get('user_id'):
-            flash('Please log in to access this page.', 'warning')
+            flash('Please log in.', 'warning')
             return redirect(url_for('login'))
         return f(*args, **kwargs)
     return decorated
@@ -256,12 +154,12 @@ def admin_required(f):
     @wraps(f)
     def decorated(*args, **kwargs):
         if not session.get('admin_logged_in'):
-            flash('Admin access is required.', 'warning')
+            flash('Admin access required.', 'warning')
             return redirect(url_for('admin_login'))
         return f(*args, **kwargs)
     return decorated
 
-# ---------- Master Shell View UI Template (unchanged) ----------
+# ---------- HTML Templates (unchanged from original) ----------
 BASE_HTML = '''
 <!DOCTYPE html>
 <html lang="en">
@@ -456,7 +354,6 @@ BASE_HTML = '''
 </html>
 '''
 
-# ---------- Web Content Sub-Templates (unchanged) ----------
 LANDING_CONTENT = '''
 <div class="space-y-20 py-6" data-aos="fade-up">
     <div class="text-center max-w-4xl mx-auto space-y-6 pt-4">
@@ -1026,13 +923,11 @@ ADMIN_LOGIN_CONTENT = '''
 </div>
 '''
 
-# ---------- Page Assembler Helper (uses session cache) ----------
+# ---------- Page Renderer (uses session cache) ----------
 def render_page(content_template, title="OTP Matrix", **context):
-    """Render the page with user data from session if available, else from Firestore."""
     user = None
     if session.get('user_id'):
-        # Use session cache if present, else fetch from DB and cache
-        if 'user_credits' in session and 'username' in session:
+        if 'user_credits' in session:
             user = {
                 'id': session['user_id'],
                 'username': session.get('username'),
@@ -1042,14 +937,13 @@ def render_page(content_template, title="OTP Matrix", **context):
         else:
             user = get_user_by_id(session['user_id'])
             if user:
-                session['user_credits'] = user.get('credits', 0)
-                session['username'] = user.get('username')
-                session['user_email'] = user.get('email')
+                session['user_credits'] = user['credits']
+                session['username'] = user['username']
+                session['user_email'] = user['email']
     content_rendered = render_template_string(content_template, **context)
     return render_template_string(BASE_HTML, title=title, content=content_rendered, user=user)
 
-# ---------- Route Definitions (with session cache updates) ----------
-
+# ---------- Routes ----------
 @app.route('/')
 def home():
     return render_page(LANDING_CONTENT, title="Home – Fast OTP Service")
@@ -1057,16 +951,7 @@ def home():
 @app.route('/dashboard')
 @login_required
 def dashboard():
-    # Refresh credits from session or DB
-    user = None
-    if session.get('user_id'):
-        if 'user_credits' in session:
-            user = {'credits': session['user_credits']}
-        else:
-            user = get_user_by_id(session['user_id'])
-            if user:
-                session['user_credits'] = user.get('credits', 0)
-    credits = user['credits'] if user else 0
+    credits = session.get('user_credits', 0)
     return render_page(DASHBOARD_CONTENT, title="Dashboard Console", credits=credits)
 
 @app.route('/send-otp', methods=['POST'])
@@ -1074,20 +959,18 @@ def dashboard():
 def send_otp():
     user = get_user_by_id(session['user_id'])
     if not user:
-        return jsonify({'success': False, 'message': 'User session not found.'}), 401
-
+        return jsonify({'success': False, 'message': 'User not found.'}), 401
     if user['credits'] < 1:
-        return jsonify({'success': False, 'message': 'You have 0 credits. Please buy credits to continue.'}), 403
+        return jsonify({'success': False, 'message': 'Insufficient credits.'}), 403
 
     email = request.form.get('email', '').strip()
     username = request.form.get('username', '').strip() or None
     ip = request.remote_addr
 
     if not email or '@' not in email:
-        return jsonify({'success': False, 'message': 'Please enter a valid email address.'}), 400
+        return jsonify({'success': False, 'message': 'Invalid email.'}), 400
 
     result, error = send_otp_via_api(email, username)
-    
     if error:
         success = 0
         error_msg = error
@@ -1097,11 +980,13 @@ def send_otp():
 
     if success == 1:
         if not deduct_credit(user['id']):
-            return jsonify({'success': False, 'message': 'Failed to complete credit update.'}), 500
+            return jsonify({'success': False, 'message': 'Credit deduction failed.'}), 500
+        session['user_credits'] = user['credits'] - 1
+    else:
+        session['user_credits'] = user['credits']
 
-    # Log the request in Firestore
-    db = get_firestore()
-    request_data = {
+    # Log the request
+    log_data = {
         'user_id': user['id'],
         'email': email,
         'username': username,
@@ -1109,114 +994,94 @@ def send_otp():
         'error_message': error_msg,
         'ip_address': ip,
         'user_agent': request.headers.get('User-Agent'),
-        'timestamp': firestore.SERVER_TIMESTAMP
+        'timestamp': datetime.now(timezone.utc).isoformat()
     }
-    db.collection('requests').add(request_data)
-
-    # Update session credit after successful deduction
-    updated_user = get_user_by_id(user['id'])
-    if updated_user:
-        session['user_credits'] = updated_user['credits']
+    supabase.table('requests').insert(log_data).execute()
 
     if success == 1:
         return jsonify({'success': True, 'message': 'OTP sent successfully!', 'credits': session['user_credits']})
     else:
-        return jsonify({'success': False, 'message': f"Server error: {error_msg or 'Failed to process request.'}", 'credits': session['user_credits']})
+        return jsonify({'success': False, 'message': f"Server error: {error_msg or 'Failed.'}", 'credits': session['user_credits']})
 
 @app.route('/register', methods=['GET', 'POST'])
 def register():
     if session.get('user_id'):
         return redirect(url_for('dashboard'))
-
     if request.method == 'POST':
         username = request.form.get('username', '').strip()
         email = request.form.get('email', '').strip()
         password = request.form.get('password', '').strip()
-
         if not username or not email or not password:
-            flash('All fields are required.', 'error')
-            return render_page(REGISTER_CONTENT, title="Register Account")
-
+            flash('All fields required.', 'error')
+            return render_page(REGISTER_CONTENT, title="Register")
         if len(password) < 6:
-            flash('Password must be at least 6 characters long.', 'error')
-            return render_page(REGISTER_CONTENT, title="Register Account")
-
+            flash('Password too short.', 'error')
+            return render_page(REGISTER_CONTENT, title="Register")
         if get_user_by_username(username):
-            flash('Username is already taken.', 'error')
-            return render_page(REGISTER_CONTENT, title="Register Account")
+            flash('Username taken.', 'error')
+            return render_page(REGISTER_CONTENT, title="Register")
         if get_user_by_email(email):
-            flash('Email is already registered.', 'error')
-            return render_page(REGISTER_CONTENT, title="Register Account")
-
+            flash('Email registered.', 'error')
+            return render_page(REGISTER_CONTENT, title="Register")
         hashed = hash_password(password)
-        try:
-            create_user(username, email, hashed, credits=1)
-            flash('Account created successfully! You received 1 free credit. Please log in.', 'success')
+        user_id = create_user(username, email, hashed, credits=1)
+        if user_id:
+            flash('Account created! Please log in.', 'success')
             return redirect(url_for('login'))
-        except Exception as e:
-            flash(f'Registration failed: {str(e)}', 'error')
-
-    return render_page(REGISTER_CONTENT, title="Register Account")
+        else:
+            flash('Registration error.', 'error')
+    return render_page(REGISTER_CONTENT, title="Register")
 
 @app.route('/login', methods=['GET', 'POST'])
 def login():
     if session.get('user_id'):
         return redirect(url_for('dashboard'))
-
     if request.method == 'POST':
         email = request.form.get('email', '').strip()
         password = request.form.get('password', '').strip()
         if not email or not password:
-            flash('Please fill in all details.', 'error')
+            flash('Please fill all fields.', 'error')
             return render_page(LOGIN_CONTENT, title="Login")
-
         user = get_user_by_email(email)
         if not user or not verify_password(password, user['password_hash']):
-            flash('Invalid email or password.', 'error')
+            flash('Invalid credentials.', 'error')
             return render_page(LOGIN_CONTENT, title="Login")
-
-        # Store user data in session
         session['user_id'] = user['id']
         session['user_credits'] = user['credits']
         session['username'] = user['username']
         session['user_email'] = user['email']
-        flash('Logged in successfully. Welcome back!', 'success')
+        flash('Logged in.', 'success')
         return redirect(url_for('dashboard'))
-
-    return render_page(LOGIN_CONTENT, title="Login Account")
+    return render_page(LOGIN_CONTENT, title="Login")
 
 @app.route('/logout')
 def logout():
     session.clear()
-    flash('Logged out successfully.', 'info')
+    flash('Logged out.', 'info')
     return redirect(url_for('home'))
 
 @app.route('/profile')
 @login_required
 def profile():
-    # Refresh user data from DB (credits may have changed)
     user = get_user_by_id(session['user_id'])
     if not user:
-        flash('User account error.', 'error')
+        flash('User error.', 'error')
         return redirect(url_for('logout'))
-    # Update session cache
     session['user_credits'] = user['credits']
-
-    # Get recent requests for this user
-    db = get_firestore()
-    requests_ref = db.collection('requests').where('user_id', '==', user['id']).order_by('timestamp', direction=firestore.Query.DESCENDING).limit(20)
+    # Fetch recent requests
+    resp = supabase.table('requests').select('*').eq('user_id', user['id']).order('timestamp', desc=True).limit(20).execute()
     requests_logs = []
-    for doc in requests_ref.stream():
-        data = doc.to_dict()
-        ts = data.get('timestamp')
-        if hasattr(ts, 'strftime'):
-            ts = ts.strftime('%Y-%m-%d %H:%M:%S')
+    for row in resp.data:
+        ts = row.get('timestamp')
+        if ts:
+            # Convert to string if it's a datetime object
+            if hasattr(ts, 'strftime'):
+                ts = ts.strftime('%Y-%m-%d %H:%M:%S')
         requests_logs.append({
-            'email': data.get('email'),
-            'success': data.get('success'),
+            'email': row.get('email'),
+            'success': row.get('success'),
             'timestamp': ts
         })
-
     return render_page(PROFILE_CONTENT, title="My Profile", user=user, requests=requests_logs)
 
 @app.route('/redeem', methods=['POST'])
@@ -1224,29 +1089,25 @@ def profile():
 def redeem():
     code = request.form.get('redeem_code', '').strip()
     expected_amount_str = request.form.get('expected_amount', '0').strip()
-    
     try:
         expected_amount = int(expected_amount_str)
     except ValueError:
         expected_amount = 0
-
     if not code:
-        return jsonify({'success': False, 'message': 'Please input a valid code string.'}), 400
-    
+        return jsonify({'success': False, 'message': 'Enter code.'}), 400
     if expected_amount <= 0:
-        return jsonify({'success': False, 'message': 'Please select a valid package.'}), 400
+        return jsonify({'success': False, 'message': 'Select a package.'}), 400
 
-    db = get_firestore()
-    # Check if code already exists
-    existing = db.collection('redeem_codes').where('code', '==', code).limit(1).stream()
-    for doc in existing:
-        data = doc.to_dict()
-        if data['status'] == 'approved':
-            return jsonify({'success': False, 'message': 'This redeem code has already been used.'}), 400
-        elif data['status'] == 'rejected':
-            return jsonify({'success': False, 'message': 'This redeem code has expired or was rejected.'}), 400
+    # Check if code exists
+    resp = supabase.table('redeem_codes').select('*').eq('code', code).execute()
+    if resp.data:
+        existing = resp.data[0]
+        if existing['status'] == 'approved':
+            return jsonify({'success': False, 'message': 'Code already used.'}), 400
+        elif existing['status'] == 'rejected':
+            return jsonify({'success': False, 'message': 'Code rejected.'}), 400
         else:
-            return jsonify({'success': True, 'message': 'This code is already under review.'})
+            return jsonify({'success': True, 'message': 'Code already under review.'})
 
     # Insert new redeem code
     redeem_data = {
@@ -1254,87 +1115,74 @@ def redeem():
         'user_id': session['user_id'],
         'amount': expected_amount,
         'status': 'pending',
-        'requested_at': firestore.SERVER_TIMESTAMP,
+        'requested_at': datetime.now(timezone.utc).isoformat(),
         'approved_at': None,
         'admin_notes': None
     }
-    db.collection('redeem_codes').add(redeem_data)
-    return jsonify({'success': True, 'message': 'Code submitted successfully! Credits will be added once approved.'})
+    supabase.table('redeem_codes').insert(redeem_data).execute()
+    return jsonify({'success': True, 'message': 'Code submitted for approval.'})
 
 @app.route('/admin/login', methods=['GET', 'POST'])
 def admin_login():
     if session.get('admin_logged_in'):
         return redirect(url_for('admin_dashboard'))
-
     if request.method == 'POST':
         username = request.form.get('username', '').strip()
         password = request.form.get('password', '').strip()
         if username == app.config['ADMIN_USERNAME'] and password == app.config['ADMIN_PASSWORD']:
             session['admin_logged_in'] = True
-            flash('Admin dashboard loaded successfully.', 'success')
+            flash('Admin logged in.', 'success')
             return redirect(url_for('admin_dashboard'))
         else:
-            flash('Invalid administrator credentials.', 'error')
-
+            flash('Invalid admin credentials.', 'error')
     return render_page(ADMIN_LOGIN_CONTENT, title="Admin Login")
 
 @app.route('/admin/logout')
 def admin_logout():
     session.pop('admin_logged_in', None)
-    flash('Admin session cleared.', 'info')
+    flash('Admin logged out.', 'info')
     return redirect(url_for('home'))
 
 @app.route('/admin')
 @admin_required
 def admin_dashboard():
-    db = get_firestore()
-    total_users = len(list(db.collection('users').stream()))
-    success_otp = len(list(db.collection('requests').where('success', '==', 1).stream()))
-    failed_otp = len(list(db.collection('requests').where('success', '==', 0).stream()))
-    pending_redeems = len(list(db.collection('redeem_codes').where('status', '==', 'pending').stream()))
+    # Counts
+    total_users = len(supabase.table('users').select('id', count='exact').execute().data)
+    success_otp = len(supabase.table('requests').select('id', count='exact').eq('success', 1).execute().data)
+    failed_otp = len(supabase.table('requests').select('id', count='exact').eq('success', 0).execute().data)
+    pending_redeems = len(supabase.table('redeem_codes').select('id', count='exact').eq('status', 'pending').execute().data)
 
     # Pending redeem codes with user details
+    resp_codes = supabase.table('redeem_codes').select('*, users(username)').eq('status', 'pending').order('requested_at').execute()
     pending_codes = []
-    for doc in db.collection('redeem_codes').where('status', '==', 'pending').order_by('requested_at').stream():
-        data = doc.to_dict()
-        # Fetch username for user_id
-        user_docs = db.collection('users').where('id', '==', data['user_id']).limit(1).stream()
-        username = None
-        for u in user_docs:
-            username = u.to_dict().get('username')
+    for row in resp_codes.data:
         pending_codes.append({
-            'id': doc.id,
-            'code': data['code'],
-            'user_id': data['user_id'],
-            'amount': data['amount'],
-            'username': username,
-            'requested_at': data.get('requested_at')
+            'id': row['id'],
+            'code': row['code'],
+            'user_id': row['user_id'],
+            'amount': row['amount'],
+            'username': row.get('users', {}).get('username') if row.get('users') else None,
+            'requested_at': row.get('requested_at')
         })
 
-    # Recent logs (last 50)
+    # Recent logs with username
+    resp_logs = supabase.table('requests').select('*, users(username)').order('timestamp', desc=True).limit(50).execute()
     logs = []
-    for doc in db.collection('requests').order_by('timestamp', direction=firestore.Query.DESCENDING).limit(50).stream():
-        data = doc.to_dict()
-        ts = data.get('timestamp')
+    for row in resp_logs.data:
+        ts = row.get('timestamp')
         if hasattr(ts, 'strftime'):
             ts = ts.strftime('%Y-%m-%d %H:%M:%S')
-        # Get username if user_id exists
-        username = None
-        if data.get('user_id'):
-            user_docs = db.collection('users').where('id', '==', data['user_id']).limit(1).stream()
-            for u in user_docs:
-                username = u.to_dict().get('username')
         logs.append({
-            'id': doc.id[:8],
-            'email': data.get('email'),
-            'success': data.get('success'),
-            'error_message': data.get('error_message'),
-            'ip_address': data.get('ip_address'),
+            'id': str(row['id'])[:8],
+            'email': row.get('email'),
+            'success': row.get('success'),
+            'error_message': row.get('error_message'),
+            'ip_address': row.get('ip_address'),
             'timestamp': ts,
-            'username': username
+            'username': row.get('users', {}).get('username') if row.get('users') else None
         })
 
-    return render_page(ADMIN_DASHBOARD_CONTENT, title="Admin Command Center",
+    return render_page(ADMIN_DASHBOARD_CONTENT, title="Admin Dashboard",
                        total_users=total_users, success_otp=success_otp, failed_otp=failed_otp,
                        pending_redeems=pending_redeems, pending_codes=pending_codes, logs=logs)
 
@@ -1344,62 +1192,59 @@ def admin_approve_code():
     code_id = request.form.get('code_id')
     action = request.form.get('action')
     amount = request.form.get('amount')
-
     if not code_id or not action:
-        flash('Invalid verification parameters.', 'error')
+        flash('Missing parameters.', 'error')
         return redirect(url_for('admin_dashboard'))
 
-    db = get_firestore()
-    doc_ref = db.collection('redeem_codes').document(code_id)
-    doc = doc_ref.get()
-    if not doc.exists:
-        flash('Redeem code reference not found.', 'error')
+    # Fetch the code
+    resp = supabase.table('redeem_codes').select('*').eq('id', code_id).execute()
+    if not resp.data:
+        flash('Code not found.', 'error')
         return redirect(url_for('admin_dashboard'))
+    code_data = resp.data[0]
 
-    code_data = doc.to_dict()
     if action == 'approve':
         try:
             amount = int(amount)
             if amount <= 0:
-                flash('Credit value configuration must be a positive number.', 'error')
+                flash('Amount must be positive.', 'error')
                 return redirect(url_for('admin_dashboard'))
         except ValueError:
-            flash('Invalid credit amount entered.', 'error')
+            flash('Invalid amount.', 'error')
             return redirect(url_for('admin_dashboard'))
 
-        doc_ref.update({
+        # Update status
+        supabase.table('redeem_codes').update({
             'status': 'approved',
             'amount': amount,
-            'approved_at': firestore.SERVER_TIMESTAMP
-        })
+            'approved_at': datetime.now(timezone.utc).isoformat()
+        }).eq('id', code_id).execute()
+
+        # Add credits
         add_credits(code_data['user_id'], amount)
-        # Update session credit if the user is the current one
         if session.get('user_id') == code_data['user_id']:
             user = get_user_by_id(session['user_id'])
             if user:
                 session['user_credits'] = user['credits']
-        flash(f'Code approved successfully! Added {amount} credits to the user account.', 'success')
-
+        flash(f'Approved – added {amount} credits.', 'success')
     elif action == 'reject':
-        doc_ref.update({'status': 'rejected'})
-        flash('Redeem code request rejected.', 'info')
-
+        supabase.table('redeem_codes').update({'status': 'rejected'}).eq('id', code_id).execute()
+        flash('Rejected.', 'info')
+    else:
+        flash('Unknown action.', 'error')
     return redirect(url_for('admin_dashboard'))
 
 @app.route('/api/send', methods=['POST'])
 def api_send():
     data = request.get_json()
     if not data:
-        return jsonify({'error': 'JSON layout required'}), 400
-
+        return jsonify({'error': 'JSON required'}), 400
     api_key = data.get('api_key')
     if not api_key or api_key not in app.config['API_KEYS']:
-        return jsonify({'error': 'Unauthorized API Key'}), 401
-
+        return jsonify({'error': 'Unauthorized'}), 401
     email = data.get('email', '').strip()
     if not email or '@' not in email:
-        return jsonify({'error': 'Invalid recipient email'}), 400
-
+        return jsonify({'error': 'Invalid email'}), 400
     username = data.get('username', '').strip() or None
     ip = request.remote_addr
 
@@ -1407,12 +1252,12 @@ def api_send():
     if user_id:
         user = get_user_by_id(user_id)
         if not user:
-            return jsonify({'error': 'User profile not discovered'}), 404
+            return jsonify({'error': 'User not found'}), 404
         if user['credits'] < 1:
             return jsonify({'error': 'Insufficient credits'}), 403
     else:
         if not check_rate_limit(ip):
-            return jsonify({'error': 'Rate limit exceeded for guests'}), 429
+            return jsonify({'error': 'Rate limit exceeded'}), 429
 
     result, error = send_otp_via_api(email, username)
     if error:
@@ -1424,9 +1269,8 @@ def api_send():
 
     if success == 1 and user_id:
         if not deduct_credit(user_id):
-            return jsonify({'error': 'Transactional ledger update failed'}), 500
+            return jsonify({'error': 'Credit deduction failed'}), 500
 
-    db = get_firestore()
     log_data = {
         'user_id': user_id,
         'email': email,
@@ -1435,16 +1279,16 @@ def api_send():
         'error_message': error_msg,
         'ip_address': ip,
         'user_agent': request.headers.get('User-Agent'),
-        'timestamp': firestore.SERVER_TIMESTAMP
+        'timestamp': datetime.now(timezone.utc).isoformat()
     }
-    db.collection('requests').add(log_data)
+    supabase.table('requests').insert(log_data).execute()
 
     if success:
-        return jsonify({'status': 'success', 'message': 'OTP delivery completed successfully.'})
+        return jsonify({'status': 'success', 'message': 'OTP sent.'})
     else:
-        return jsonify({'status': 'error', 'message': error_msg or 'Upstream response error'}), 500
+        return jsonify({'status': 'error', 'message': error_msg or 'Failed.'}), 500
 
-# ---------- Server Launch ----------
+# ---------- Main ----------
 if __name__ == '__main__':
     port = int(os.environ.get("PORT", 8080))
     app.run(host='0.0.0.0', port=port, debug=False)
